@@ -292,11 +292,13 @@ frappe.Application = class Application {
 	setup_workspaces() {
 		frappe.modules = {};
 		frappe.workspaces = {};
+		frappe.workspace_map = {};
 		frappe.boot.allowed_workspaces = frappe.boot.workspaces.pages;
 
 		for (let page of frappe.boot.allowed_workspaces || []) {
 			frappe.modules[page.module] = page;
 			frappe.workspaces[frappe.router.slug(page.name)] = page;
+			frappe.workspace_map[page.name] = page;
 		}
 	}
 
