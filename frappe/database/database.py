@@ -39,6 +39,7 @@ from frappe.utils import (
 	CallbackManager,
 	cint,
 	get_datetime,
+	get_system_timezone,
 	get_table_name,
 	getdate,
 	now,
@@ -72,6 +73,9 @@ CREATE_OR_DROP = frozenset(("create", "drop"))
 COMMIT_OR_ROLLBACK = frozenset(("commit", "rollback"))
 WRITE_QUERY_TYPES = frozenset(("update", "insert", "delete"))
 QUERY_TYPES_FOR_LOG_TOUCHED_TABLES = frozenset(("insert", "delete", "update", "alter", "drop", "rename"))
+
+assert CREATE_OR_DROP <= DDL_QUERY_TYPES, "CREATE_OR_DROP must be a subset of DDL_QUERY_TYPES"
+assert COMMIT_OR_ROLLBACK.isdisjoint(WRITE_QUERY_TYPES), "commit/rollback are not write queries"
 
 SQL_ITERATOR_BATCH_SIZE = 1000
 
@@ -154,9 +158,18 @@ class Database:
 		except Exception as e:
 			self.logger.warning(f"Couldn't set execution timeout {e}")
 
+		try:
+			self.set_session_time_zone(get_system_timezone())
+		except Exception as e:
+			self.logger.warning(f"Couldn't set session time zone {e}")
+
 	def set_execution_timeout(self, seconds: int):
 		"""Set session speicifc timeout on exeuction of statements.
 		If any statement takes more time it will be killed along with entire transaction."""
+		raise NotImplementedError
+
+	def set_session_time_zone(self, timezone: str):
+		"""Set session time zone so database clock functions match the system timezone."""
 		raise NotImplementedError
 
 	def use(self, db_name):
@@ -230,6 +243,7 @@ class Database:
 
 		debug = debug or getattr(self, "debug", False)
 		query = str(query)
+		assert isinstance(query, str), "query must be a string after coercion"
 
 		if not run:
 			return query
@@ -475,6 +489,9 @@ class Database:
 
 		if query_type in WRITE_QUERY_TYPES:
 			self.transaction_writes += 1
+			if frappe.conf.get("max_writes_per_transaction"):
+				self.MAX_WRITES_PER_TRANSACTION = cint(frappe.conf.max_writes_per_transaction)
+
 			if self.transaction_writes > self.MAX_WRITES_PER_TRANSACTION:
 				if self.auto_commit_on_many_writes:
 					self.commit()
@@ -837,6 +854,7 @@ class Database:
 			modified_by = modified_by or frappe.session.user
 			update_dict.update({"modified": modified, "modified_by": modified_by})
 
+		assert isinstance(update_dict, dict), "update dict must be a dict"
 		return update_dict
 
 	def set_single_value(
@@ -1112,6 +1130,7 @@ class Database:
 
 		conditions = {}
 		docnames = list(doc_updates.keys())
+		assert docnames, "doc_updates must be non-empty here (empty case returns early)"
 
 		for docname, row in doc_updates.items():
 			for field, value in row.items():
@@ -1298,9 +1317,23 @@ class Database:
 			self.value_cache[dt][cache_key] = count
 		return count
 
-	def estimate_count(self, doctype: str) -> int:
-		"""Get estimated count of total rows in a table."""
+	def _estimate_count(self, table: str) -> int:
+		"""Get estimated count of total rows in a single table. Override in subclasses."""
 		raise NotImplementedError
+
+	def estimate_count(self, doctype: str) -> int:
+		"""Get estimated count of total rows in a table.
+
+		The estimate is read one table at a time and cached in Redis with a 60-minute TTL
+		to avoid hammering information_schema.
+		"""
+		table = get_table_name(doctype)
+		cache_key = f"estimate_count::{table}"
+		count = frappe.cache.get_value(cache_key)
+		if count is None:
+			count = self._estimate_count(table)
+			frappe.cache.set_value(cache_key, count, expires_in_sec=60 * 60)
+		return count
 
 	@staticmethod
 	def format_date(date):
@@ -1343,7 +1376,7 @@ class Database:
 			)
 
 			if columns:
-				frappe.cache.set_value(key, columns)
+				frappe.client_cache.set_value(key, columns)
 
 		return columns
 
@@ -1361,7 +1394,7 @@ class Database:
 	def has_index(self, table_name, index_name):
 		raise NotImplementedError
 
-	def add_index(self, doctype, fields, index_name=None):
+	def add_index(self, doctype, fields, index_name=None, using=None, where=None, include=None):
 		raise NotImplementedError
 
 	def add_unique(self, doctype, fields, constraint_name=None):
@@ -1412,6 +1445,7 @@ class Database:
 		"""
 		current_dialect = self.db_type or "mariadb"
 		query = sql_dict.get(current_dialect) or sql_dict.get("*")
+		assert query is not None, f"multisql has no query for dialect {current_dialect!r} and no '*' fallback"
 		return self.sql(query, values, **kwargs)
 
 	def delete(self, doctype: str, filters: dict | list | None = None, debug=False, **kwargs):
@@ -1505,6 +1539,22 @@ class Database:
 		value_iterator = iter(values)
 		while value_chunk := tuple(itertools.islice(value_iterator, chunk_size)):
 			query.insert(*value_chunk).run()
+
+	def advisory_lock(self, key, *, timeout=10):
+		"""Hold a session-level advisory lock for the duration of the `with` block. Postgres uses
+		pg_advisory_lock, MariaDB uses GET_LOCK; engines without advisory locks raise."""
+		raise NotImplementedError(f"Advisory locks are not supported on {self.db_type}.")
+
+	def transaction_advisory_lock(self, key, *, timeout=10):
+		"""Take an advisory lock released automatically when the current transaction ends.
+		Postgres only (pg_advisory_xact_lock); other engines have no transaction-scoped
+		advisory locks and raise."""
+		raise NotImplementedError(f"Transaction-scoped advisory locks are not supported on {self.db_type}.")
+
+	def create_sequence_table(self):
+		# MariaDB/Postgres have native sequences and need no backing table;
+		# SQLite overrides this to create its emulation table at site setup.
+		pass
 
 	def create_sequence(self, *args, **kwargs):
 		from frappe.database.sequence import create_sequence

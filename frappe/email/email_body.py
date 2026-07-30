@@ -431,6 +431,7 @@ def get_formatted_html(
 		params.update(
 			{
 				"brand_logo": get_brand_logo(email_account) if with_container or header else None,
+				"brand_name": get_brand_name() if with_container or header else None,
 				"with_container": with_container,
 				"header": get_header(header),
 				"content": message,
@@ -450,17 +451,15 @@ def get_formatted_html(
 @frappe.whitelist()
 def get_email_html(
 	template: str,
-	args: str,
+	args: str | dict,
 	subject: str,
 	header: str | list | None = None,
 	with_container: str | int | bool = False,
 ):
-	import json
-
 	with_container = cint(with_container)
-	args = json.loads(args)
-	if header and header.startswith("["):
-		header = json.loads(header)
+	args = frappe.parse_json(args)
+	if isinstance(header, str) and header.startswith("["):
+		header = frappe.parse_json(header)
 	email = frappe.utils.jinja.get_email_from_template(template, args)
 	return get_formatted_html(subject, email[0], header=header, with_container=with_container)
 
@@ -698,4 +697,8 @@ def sanitize_email_header(header: str):
 
 
 def get_brand_logo(email_account):
-	return email_account.get("brand_logo")
+	return (email_account and email_account.get("brand_logo")) or frappe.get_website_settings("app_logo")
+
+
+def get_brand_name():
+	return frappe.get_website_settings("app_name") or frappe.get_system_settings("app_name")

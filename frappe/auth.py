@@ -25,8 +25,9 @@ from frappe.utils import cint, date_diff, datetime, get_datetime, today
 from frappe.utils.password import check_password, get_decrypted_password
 from frappe.website.utils import get_home_page
 
-SAFE_HTTP_METHODS = frozenset(("GET", "HEAD", "OPTIONS"))
+SAFE_HTTP_METHODS = frozenset(("GET", "HEAD", "OPTIONS", "QUERY"))
 UNSAFE_HTTP_METHODS = frozenset(("POST", "PUT", "DELETE", "PATCH"))
+assert SAFE_HTTP_METHODS.isdisjoint(UNSAFE_HTTP_METHODS), "a HTTP method cannot be both safe and unsafe"
 MAX_PASSWORD_SIZE = 512
 
 
@@ -239,6 +240,9 @@ class LoginManager:
 
 		# reset user if changed to Guest
 		self.user = frappe.local.session_obj.user
+		assert isinstance(self.user, str) and self.user, (
+			"session must always resolve to a non-empty user name"
+		)
 		frappe.local.session = frappe.local.session_obj.data
 		self.clear_active_sessions()
 		if not resume:
@@ -298,6 +302,7 @@ class LoginManager:
 			user_tracker and user_tracker.add_success_attempt()
 			ip_tracker and ip_tracker.add_success_attempt()
 		self.user = user.name
+		assert self.user, "authenticated user name must be set after successful authentication"
 
 	def force_user_to_reset_password(self):
 		if not self.user:
@@ -659,6 +664,7 @@ def validate_oauth(authorization_header):
 	        authorization_header (list of str): The 'Authorization' header containing the prefix and token
 	"""
 
+	from frappe.integrations.doctype.oauth_bearer_token.oauth_bearer_token import get_oauth_token_hash
 	from frappe.integrations.oauth2 import get_oauth_server
 	from frappe.oauth import get_url_delimiter
 
@@ -678,15 +684,20 @@ def validate_oauth(authorization_header):
 		body = None
 
 	try:
-		required_scopes = frappe.db.get_value("OAuth Bearer Token", token, "scopes").split(
-			get_url_delimiter()
+		token_hash = get_oauth_token_hash(token)
+		token_filters = {"access_token": token_hash}
+		token_details = frappe.db.get_value(
+			"OAuth Bearer Token", token_filters, ("scopes", "user"), as_dict=True
 		)
+		if not token_details:
+			return
+		required_scopes = token_details.scopes.split(get_url_delimiter())
 		valid, _oauthlib_request = get_oauth_server().verify_request(
 			uri, http_method, body, headers, required_scopes
 		)
 		if valid:
-			user = frappe.db.get_value("OAuth Bearer Token", token, "user")
-			if not frappe.db.get_value("User", user, "enabled"):
+			user = token_details.user
+			if not frappe.get_cached_value("User", user, "enabled"):
 				frappe.throw(_("User {0} is disabled").format(user), frappe.AuthenticationError)
 			frappe.set_user(user)
 			frappe.local.form_dict = form_dict
@@ -726,9 +737,13 @@ def validate_api_key_secret(api_key, api_secret, frappe_authorization_source=Non
 		raise frappe.AuthenticationError
 
 	doctype = frappe_authorization_source or "User"
-	docname = frappe.db.get_value(
-		doctype=doctype, filters={"api_key": api_key, "enabled": True}, fieldname=["name"]
-	)
+	try:
+		docname = frappe.db.get_value(
+			doctype=doctype, filters={"api_key": api_key, "enabled": True}, fieldname=["name"]
+		)
+	except Exception:
+		raise frappe.AuthenticationError
+
 	if not docname:
 		raise frappe.AuthenticationError
 	form_dict = frappe.local.form_dict
